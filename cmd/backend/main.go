@@ -90,6 +90,21 @@ func main() {
 
 	log.SetFlags(log.Ldate | log.Ltime)
 
+	// Validate required flags.
+	var missing []string
+	if *centralServerAuth == "" {
+		missing = append(missing, "  -central-server-auth: URL to GET the authentication user list (e.g. -central-server-auth http://10.0.0.1:8080/users)")
+	}
+	if *centralServerTraffic == "" {
+		missing = append(missing, "  -central-server-traffic: URL to POST accumulated traffic (e.g. -central-server-traffic http://10.0.0.1:8080/traffic)")
+	}
+	if *serverID == "" {
+		missing = append(missing, "  -server-id: Server ID sent to central server as path segment (e.g. -server-id my-server-1)")
+	}
+	if len(missing) > 0 {
+		log.Fatalf("missing required flags:\n%s", strings.Join(missing, "\n"))
+	}
+
 	app := &App{
 		authList:             make(map[string]bool),
 		trafficTable:         make(map[string]*TrafficStats),
@@ -121,10 +136,6 @@ func main() {
 // ---------------------------------------------------------------------------
 
 func (a *App) periodicAuthFetch(interval time.Duration) {
-	if a.centralServerAuth == "" {
-		log.Println("central-server-auth not set, skipping auth fetch")
-		return
-	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -360,10 +371,6 @@ func (a *App) fetchTraffic() {
 // ---------------------------------------------------------------------------
 
 func (a *App) periodicTrafficReport(interval time.Duration) {
-	if a.centralServerTraffic == "" {
-		log.Println("central-server-traffic not set, skipping traffic report")
-		return
-	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
