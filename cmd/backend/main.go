@@ -46,6 +46,7 @@ type App struct {
 	trafficServer        string
 	secret   string
 	serverID string
+	debug    bool
 }
 
 const banner = `
@@ -83,8 +84,11 @@ func main() {
 	intervalKick := flag.Duration("interval-kick", 10*time.Second, "Interval to check and kick unauthorized users")
 	intervalTrafficFromProxy := flag.Duration("interval-traffic-from-proxy", 10*time.Second, "Interval to fetch traffic from proxy")
 	intervalTrafficToCentral := flag.Duration("interval-traffic-to-central", 10*time.Second, "Interval to report traffic to central server")
+	debug := flag.Bool("debug", false, "Enable debug logging (show response bodies for all requests)")
 
 	flag.Parse()
+
+	log.SetFlags(log.Ldate | log.Ltime)
 
 	app := &App{
 		authList:             make(map[string]bool),
@@ -95,6 +99,7 @@ func main() {
 		trafficServer:        *trafficServer,
 		secret:               *secret,
 		serverID: *serverID,
+		debug:    *debug,
 	}
 
 	// Start periodic background tasks.
@@ -168,6 +173,9 @@ func (a *App) fetchAuthList() {
 	a.authMu.Unlock()
 
 	log.Printf("auth list updated: %d users", len(newList))
+	if a.debug {
+		log.Printf("[DEBUG] auth list: %v", users)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +204,11 @@ func (a *App) kickUnauthorized() {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("kick check: /online returned %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusUnauthorized {
+			log.Printf("kick check: /online returned 401 Unauthorized. Make sure the -secret flag matches the trafficStats secret in the Hysteria server config.")
+		} else {
+			log.Printf("kick check: /online returned %d", resp.StatusCode)
+		}
 		return
 	}
 
@@ -204,6 +216,10 @@ func (a *App) kickUnauthorized() {
 	if err := json.NewDecoder(resp.Body).Decode(&online); err != nil {
 		log.Printf("kick check: decode /online error: %v", err)
 		return
+	}
+
+	if a.debug {
+		log.Printf("[DEBUG] GET /online: %d users online: %v", len(online), online)
 	}
 
 	// Build list of users to kick.
@@ -237,6 +253,8 @@ func (a *App) kickUnauthorized() {
 
 	if kickResp.StatusCode != http.StatusOK {
 		log.Printf("kick check: /kick returned %d", kickResp.StatusCode)
+	} else if a.debug {
+		log.Printf("[DEBUG] POST /kick: successfully kicked %d users", len(toKick))
 	}
 }
 
@@ -265,9 +283,15 @@ func (a *App) handleAuth(w http.ResponseWriter, r *http.Request) {
 	if allowed {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(AuthResponse{OK: true, ID: authReq.Auth})
+		if a.debug {
+			log.Printf("[DEBUG] auth request from %s: user=%s allowed=true", authReq.Addr, authReq.Auth)
+		}
 	} else {
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(AuthResponse{OK: false})
+		if a.debug {
+			log.Printf("[DEBUG] auth request from %s: user=%s allowed=false", authReq.Addr, authReq.Auth)
+		}
 	}
 }
 
@@ -296,7 +320,11 @@ func (a *App) fetchTraffic() {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("traffic fetch: returned %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusUnauthorized {
+			log.Printf("traffic fetch: returned 401 Unauthorized. Make sure the -secret flag matches the trafficStats secret in the Hysteria server config.")
+		} else {
+			log.Printf("traffic fetch: returned %d", resp.StatusCode)
+		}
 		return
 	}
 
@@ -304,6 +332,13 @@ func (a *App) fetchTraffic() {
 	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
 		log.Printf("traffic fetch: decode error: %v", err)
 		return
+	}
+
+	if a.debug {
+		log.Printf("[DEBUG] GET /traffic: %d users with traffic", len(stats))
+		for user, s := range stats {
+			log.Printf("[DEBUG]   %s: tx=%d rx=%d", user, s.TX, s.RX)
+		}
 	}
 
 	// Accumulate into our traffic table.
@@ -363,6 +398,11 @@ func (a *App) reportTraffic() {
 		log.Printf("traffic report: central returned %d, keeping data", resp.StatusCode)
 		// Merge snapshot back so data is not lost.
 		a.mergeTraffic(snapshot)
+	} else if a.debug {
+		log.Printf("[DEBUG] POST traffic report: sent %d users to central server", len(snapshot))
+		for user, s := range snapshot {
+			log.Printf("[DEBUG]   %s: tx=%d rx=%d", user, s.TX, s.RX)
+		}
 	}
 }
 
