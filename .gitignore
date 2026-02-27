@@ -1,0 +1,14 @@
+backend
+central
+test-dns.db-shm
+test-dns.db-wal
+test-groups.db-shm
+test-groups.db-wal
+test-lastseen.db-shm
+test-lastseen.db-wal
+test-ls2.db-shm
+test-ls2.db-wal
+test-persist.db-shm
+test-persist.db-wal
+test-ui.db-shm
+test-ui.db-wal
