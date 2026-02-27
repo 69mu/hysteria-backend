@@ -73,6 +73,8 @@ type ServerOverview struct {
 	LastSeen         string   `json:"last_seen"`
 	UserCount        int      `json:"user_count"`
 	Groups           []string `json:"groups"`
+	TX               int64    `json:"tx"`
+	RX               int64    `json:"rx"`
 }
 
 func main() {
@@ -269,6 +271,20 @@ func initDB(db *sql.DB) error {
 	}
 	if err := backfillToken("servers"); err != nil {
 		return fmt.Errorf("backfill server tokens: %w", err)
+	}
+
+	// Migrate: create server_traffic table for per-server traffic tracking.
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS server_traffic (
+			server_id TEXT NOT NULL,
+			user_id   TEXT NOT NULL,
+			tx        INTEGER NOT NULL DEFAULT 0,
+			rx        INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (server_id, user_id)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("create server_traffic: %w", err)
 	}
 
 	return nil
@@ -892,6 +908,17 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	}
 	defer stmt.Close()
 
+	srvStmt, err := tx.Prepare(`
+		INSERT INTO server_traffic (server_id, user_id, tx, rx) VALUES (?, ?, ?, ?)
+		ON CONFLICT(server_id, user_id) DO UPDATE SET tx = tx + excluded.tx, rx = rx + excluded.rx
+	`)
+	if err != nil {
+		log.Printf("[INFO] server_traffic prepare error: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer srvStmt.Close()
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	for userKey, t := range stats {
 		// userKey is the user token (from auth endpoint). Resolve to user ID.
@@ -904,6 +931,9 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[INFO] traffic upsert error for %s: %v", userID, err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
+		}
+		if _, err := srvStmt.Exec(serverID, userID, t.TX, t.RX); err != nil {
+			log.Printf("[INFO] server_traffic upsert error for %s/%s: %v", serverID, userID, err)
 		}
 		if t.TX > 0 || t.RX > 0 {
 			tx.Exec(`UPDATE users SET last_seen = ? WHERE id = ?`, now, userID)
@@ -1943,6 +1973,9 @@ const adminPageHTML = `<!DOCTYPE html>
   <th>Hysteria</th>
   <th>Uptime</th>
   <th>Last Seen</th>
+  <th class="num">TX</th>
+  <th class="num">RX</th>
+  <th class="num">Total</th>
   <th class="num">Users</th>
   <th>Groups</th>
   <th>Actions</th>
@@ -2617,6 +2650,9 @@ function renderServers(servers) {
       + "<td>" + (s.hysteria_version || '<span style="color:#ccc">-</span>') + "</td>"
       + "<td>" + fmtUptime(s.uptime_seconds) + "</td>"
       + "<td>" + (s.last_seen ? new Date(s.last_seen).toLocaleTimeString() + ' <span style="color:#888;font-size:11px">(' + fmtAgo(s.last_seen) + ')</span>' : "-") + "</td>"
+      + '<td class="num">' + fmt(s.tx) + "</td>"
+      + '<td class="num">' + fmt(s.rx) + "</td>"
+      + '<td class="num">' + fmt(s.tx + s.rx) + "</td>"
       + '<td class="num">' + s.user_count + "</td>"
       + '<td class="servers">' + groups + "</td>"
       + '<td class="quota-actions">'
@@ -3282,6 +3318,27 @@ func (s *Server) handleAdminServerOverview(w http.ResponseWriter, r *http.Reques
 			grows.Scan(&sid, &gname)
 			if srv, ok := srvMap[sid]; ok {
 				srv.Groups = append(srv.Groups, gname)
+			}
+		}
+	}
+
+	// Fetch per-server traffic from server_traffic table.
+	trows, err := s.db.Query(`
+		SELECT server_id, COALESCE(SUM(tx), 0), COALESCE(SUM(rx), 0)
+		FROM server_traffic
+		GROUP BY server_id
+	`)
+	if err != nil {
+		log.Printf("[INFO] server traffic query error: %v", err)
+	} else {
+		defer trows.Close()
+		for trows.Next() {
+			var sid string
+			var tx, rx int64
+			trows.Scan(&sid, &tx, &rx)
+			if srv, ok := srvMap[sid]; ok {
+				srv.TX = tx
+				srv.RX = rx
 			}
 		}
 	}
