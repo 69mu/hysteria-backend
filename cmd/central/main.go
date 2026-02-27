@@ -346,7 +346,13 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
 
 	// /user/{token}/sub/shadowrocket/
 	if len(parts) >= 3 && parts[1] == "sub" && strings.TrimSuffix(parts[2], "/") == "shadowrocket" {
-		s.handleSubShadowrocket(w, r, userID)
+		s.handleSubShadowrocket(w, r, userID, token)
+		return
+	}
+
+	// /user/{token}/sub/clash/
+	if len(parts) >= 3 && parts[1] == "sub" && strings.TrimSuffix(parts[2], "/") == "clash" {
+		s.handleSubClash(w, r, userID, token)
 		return
 	}
 
@@ -397,7 +403,7 @@ func (s *Server) queryUserServers(userID string) ([]userServerInfo, error) {
 }
 
 // GET /user/{id}/sub/shadowrocket/ — plain text subscription
-func (s *Server) handleSubShadowrocket(w http.ResponseWriter, r *http.Request, userID string) {
+func (s *Server) handleSubShadowrocket(w http.ResponseWriter, r *http.Request, userID string, userToken string) {
 	var exists int
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM users WHERE id = ?", userID).Scan(&exists); err != nil || exists == 0 {
 		http.Error(w, "user not found", http.StatusNotFound)
@@ -416,12 +422,108 @@ func (s *Server) handleSubShadowrocket(w http.ResponseWriter, r *http.Request, u
 		if si.IP == "" || si.Domain == "" {
 			continue
 		}
-		lines = append(lines, fmt.Sprintf("hysteria2://%s@%s:443?peer=%s&obfs=none", userID, si.IP, si.Domain))
+		lines = append(lines, fmt.Sprintf("hysteria2://%s@%s:443?peer=%s&obfs=none#%s", userToken, si.IP, si.Domain, si.ID))
 	}
 
 	log.Printf("[INFO] GET /user/%s/sub/shadowrocket/: %d servers", userID, len(lines))
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	fmt.Fprint(w, strings.Join(lines, "\n"))
+}
+
+// GET /user/{token}/sub/clash/ — Clash YAML subscription
+func (s *Server) handleSubClash(w http.ResponseWriter, r *http.Request, userID string, userToken string) {
+	var exists int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM users WHERE id = ?", userID).Scan(&exists); err != nil || exists == 0 {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+
+	servers, err := s.queryUserServers(userID)
+	if err != nil {
+		log.Printf("[INFO] clash sub query error: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	var proxies, names strings.Builder
+	for i, si := range servers {
+		if si.IP == "" || si.Domain == "" {
+			continue
+		}
+		name := si.ID + "-hysteria2"
+		if i > 0 {
+			names.WriteString("\n")
+		}
+		names.WriteString("  - " + name)
+		proxies.WriteString(fmt.Sprintf(`- name: %s
+  type: hysteria2
+  server: %s
+  port: 443
+  password: %s
+`, name, si.Domain, userToken))
+	}
+
+	nameList := names.String()
+
+	log.Printf("[INFO] GET /user/%s/sub/clash/: %d servers", userID, len(servers))
+	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+	w.Header().Set("Content-Disposition", "attachment; filename="+userID+".yaml")
+	fmt.Fprintf(w, `port: 7890
+allow-lan: true
+mode: rule
+log-level: info
+unified-delay: true
+global-client-fingerprint: chrome
+dns:
+  enable: true
+  listen: :53
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+  - 1.1.1.1
+  - 223.5.5.5
+  - 114.114.114.114
+  - 8.8.8.8
+  nameserver:
+  - https://dns.alidns.com/dns-query
+  - https://doh.pub/dns-query
+  fallback:
+  - https://1.0.0.1/dns-query
+  - tls://dns.google
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+    - 240.0.0.0/4
+
+proxies:
+%sproxy-groups:
+- name: 负载均衡
+  type: load-balance
+  url: http://www.gstatic.com/generate_204
+  interval: 300
+  proxies:
+%s
+- name: 自动选择
+  type: url-test
+  url: http://www.gstatic.com/generate_204
+  interval: 300
+  tolerance: 50
+  proxies:
+%s
+- name: 🌍选择代理
+  type: select
+  proxies:
+  - 负载均衡
+  - 自动选择
+  - DIRECT
+%s
+rules:
+- GEOIP,LAN,DIRECT
+- GEOIP,CN,DIRECT
+- MATCH,🌍选择代理
+`, proxies.String(), nameList, nameList, nameList)
 }
 
 // GET /user/ — token login page
@@ -501,6 +603,7 @@ func (s *Server) handleUserPage(w http.ResponseWriter, r *http.Request, userID s
 	serversJSON, _ := json.Marshal(servers)
 
 	subURL := s.baseURL + "/user/" + userToken + "/sub/shadowrocket/"
+	clashURL := s.baseURL + "/user/" + userToken + "/sub/clash/"
 
 	total := tx + rx
 	var pct float64
@@ -572,7 +675,10 @@ func (s *Server) handleUserPage(w http.ResponseWriter, r *http.Request, userID s
     <div id="servers"></div>
   </div>
 
-  <button class="sub-btn" onclick="copySub(this)">Copy Subscription Link</button>
+  <div style="display:flex;gap:10px;margin-top:20px">
+    <button class="sub-btn" style="margin:0" onclick="copySub(this, subURL)">Copy Shadowrocket Subscription</button>
+    <button class="sub-btn" style="margin:0;background:#5c6bc0" onclick="copySub(this, clashURL)">Copy Clash Subscription</button>
+  </div>
 </div>
 <script>
 var GiB = 1073741824;
@@ -581,6 +687,7 @@ var pct = %f;
 var lastSeen = "%s";
 var servers = %s;
 var subURL = "%s";
+var clashURL = "%s";
 var userToken = "%s";
 
 function copyToken(box) {
@@ -628,16 +735,17 @@ if (!servers || servers.length === 0) {
   sh.innerHTML = h;
 }
 
-function copySub(btn) {
-  navigator.clipboard.writeText(subURL).then(function() {
+function copySub(btn, url) {
+  var orig = btn.textContent;
+  navigator.clipboard.writeText(url).then(function() {
     btn.textContent = "Copied!";
     btn.classList.add("copied");
-    setTimeout(function() { btn.textContent = "Copy Subscription Link"; btn.classList.remove("copied"); }, 2000);
+    setTimeout(function() { btn.textContent = orig; btn.classList.remove("copied"); }, 2000);
   });
 }
 </script>
 </body>
-</html>`, userID, userID, userToken, tx, rx, quota, pct, lastSeen, string(serversJSON), subURL, userToken)
+</html>`, userID, userID, userToken, tx, rx, quota, pct, lastSeen, string(serversJSON), subURL, clashURL, userToken)
 }
 
 // ---------------------------------------------------------------------------
@@ -662,7 +770,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := s.db.Query(`
-		SELECT DISTINCT u.id
+		SELECT DISTINCT u.token
 		FROM users u
 		LEFT JOIN traffic t ON t.user_id = u.id
 		WHERE u.quota > 0
@@ -785,7 +893,13 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	defer stmt.Close()
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	for userID, t := range stats {
+	for userKey, t := range stats {
+		// userKey is the user token (from auth endpoint). Resolve to user ID.
+		var userID string
+		if err := s.db.QueryRow("SELECT id FROM users WHERE token = ?", userKey).Scan(&userID); err != nil {
+			log.Printf("[INFO] traffic: unknown user token %s, skipping", userKey)
+			continue
+		}
 		if _, err := stmt.Exec(userID, t.TX, t.RX); err != nil {
 			log.Printf("[INFO] traffic upsert error for %s: %v", userID, err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
