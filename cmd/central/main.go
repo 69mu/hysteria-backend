@@ -98,7 +98,9 @@ func main() {
 	flag.Parse()
 
 	if *adminToken == "" {
-		*adminToken = generateToken()
+		b := make([]byte, 8)
+		rand.Read(b)
+		*adminToken = fmt.Sprintf("%x", b)
 		log.Printf("[INFO] generated admin token: %s", *adminToken)
 	}
 
@@ -262,7 +264,7 @@ func initDB(db *sql.DB) error {
 		for rows.Next() {
 			var id string
 			rows.Scan(&id)
-			db.Exec(fmt.Sprintf("UPDATE %s SET token = ? WHERE id = ?", table), generateToken(), id)
+			db.Exec(fmt.Sprintf("UPDATE %s SET token = ? WHERE id = ?", table), generateToken(db), id)
 		}
 		return nil
 	}
@@ -320,18 +322,34 @@ var idNouns = []string{
 	"whale", "willow", "wolf", "wren",
 }
 
-func generateServerID() string {
-	ai, _ := rand.Int(rand.Reader, big.NewInt(int64(len(idAdjectives))))
-	ni, _ := rand.Int(rand.Reader, big.NewInt(int64(len(idNouns))))
-	a := idAdjectives[ai.Int64()]
-	n := idNouns[ni.Int64()]
-	return a + "-" + n
+func generateServerID(db *sql.DB) string {
+	for {
+		ai, _ := rand.Int(rand.Reader, big.NewInt(int64(len(idAdjectives))))
+		ni, _ := rand.Int(rand.Reader, big.NewInt(int64(len(idNouns))))
+		id := idAdjectives[ai.Int64()] + "-" + idNouns[ni.Int64()]
+		var exists int
+		db.QueryRow("SELECT COUNT(*) FROM servers WHERE id = ?", id).Scan(&exists)
+		if exists == 0 {
+			return id
+		}
+	}
 }
 
-func generateToken() string {
-	b := make([]byte, 8)
-	rand.Read(b)
-	return fmt.Sprintf("%x", b)
+func generateToken(db *sql.DB) string {
+	for {
+		b := make([]byte, 8)
+		rand.Read(b)
+		tok := fmt.Sprintf("%x", b)
+		var exists int
+		db.QueryRow("SELECT COUNT(*) FROM users WHERE token = ?", tok).Scan(&exists)
+		if exists > 0 {
+			continue
+		}
+		db.QueryRow("SELECT COUNT(*) FROM servers WHERE token = ?", tok).Scan(&exists)
+		if exists == 0 {
+			return tok
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -995,7 +1013,7 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad request: need {\"id\":\"...\"}", http.StatusBadRequest)
 			return
 		}
-		if _, err := s.db.Exec("INSERT OR IGNORE INTO users (id, token, quota) VALUES (?, ?, ?)", body.ID, generateToken(), body.Quota); err != nil {
+		if _, err := s.db.Exec("INSERT OR IGNORE INTO users (id, token, quota) VALUES (?, ?, ?)", body.ID, generateToken(s.db), body.Quota); err != nil {
 			log.Printf("[INFO] admin add user error: %v", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
@@ -1191,7 +1209,7 @@ func (s *Server) handleAdminServerList(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if cfg.ID == "" {
-			cfg.ID = generateServerID()
+			cfg.ID = generateServerID(s.db)
 		}
 		// Apply defaults for empty fields.
 		if cfg.IntervalAuth == "" {
@@ -1215,7 +1233,7 @@ func (s *Server) handleAdminServerList(w http.ResponseWriter, r *http.Request) {
 			cfg.Size = s.doSize
 		}
 
-		cfg.Token = generateToken()
+		cfg.Token = generateToken(s.db)
 		_, err := s.db.Exec(`
 			INSERT INTO servers (id, token, acme_domain, acme_email,
 				auth_url, traffic_url, region, size,
