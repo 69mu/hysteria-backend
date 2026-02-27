@@ -1,0 +1,20 @@
+{
+	email admin@yundong.dev
+}
+
+central.yundong.dev {
+	# Admin API — protected with HTTP basic auth.
+	# Run: caddy hash-password --plaintext YOUR_PASSWORD
+	# Replace the hash below with the output.
+	handle /admin/* {
+		basicauth {
+			admin JDJhJDE0JDZTbEpySGRBRWFGQTBMb3ZIOG10V3VoVnRMTkVKZk1JYnpPSnpBeDRKMk1MckZESXQ0Zk8y
+		}
+		reverse_proxy localhost:9090
+	}
+
+	# Backend API — open to backend nodes.
+	handle {
+		reverse_proxy localhost:9090
+	}
+}

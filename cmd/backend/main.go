@@ -2,16 +2,52 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
 )
+
+const backendVersion = "2.0.0"
+
+const banner = `
+ _               _            _
+| |_ _   _ ___| |_ ___ _ __(_) __ _
+| __| | | / __| __/ _ \ '__| |/ _' |
+| |_| |_| \__ \ ||  __/ |  | | (_| |
+ \__|\__, |___/\__\___|_|  |_|\__,_|
+     |___/
+      _                _                  _
+     | |__   __ _  ___| | _____ _ __   __| |
+     | '_ \ / _' |/ __| |/ / _ \ '_ \ / _' |
+     | |_) | (_| | (__|   <  __/ | | | (_| |
+     |_.__/ \__,_|\___|_|\_\___|_| |_|\__,_|
+
+  Hysteria proxy authentication & traffic manager
+`
+
+// ServerConfig mirrors the central server's config response.
+type ServerConfig struct {
+	ID                       string `json:"id"`
+	AcmeDomain               string `json:"acme_domain"`
+	AcmeEmail                string `json:"acme_email"`
+	AuthURL                  string `json:"auth_url"`
+	TrafficURL               string `json:"traffic_url"`
+	IntervalAuth             string `json:"interval_auth"`
+	IntervalKick             string `json:"interval_kick"`
+	IntervalTrafficFromProxy string `json:"interval_traffic_from_proxy"`
+	IntervalTrafficToCentral string `json:"interval_traffic_to_central"`
+}
 
 // TrafficStats holds tx/rx byte counts for a user.
 type TrafficStats struct {
@@ -35,35 +71,38 @@ type AuthResponse struct {
 // App holds all shared state.
 type App struct {
 	authMu   sync.RWMutex
-	authList map[string]bool // set of allowed user IDs
+	authList map[string]bool
 
 	trafficMu    sync.Mutex
-	trafficTable map[string]*TrafficStats // accumulated traffic per user
+	trafficTable map[string]*TrafficStats
 
-	proxyServer          string
-	centralServerAuth    string
-	centralServerTraffic string
-	trafficServer        string
-	secret   string
-	serverID string
-	debug    bool
+	configMu sync.RWMutex
+	config   ServerConfig
+
+	centralServer    string
+	serverID         string
+	secret           string
+	listenAddr       string // backend auth HTTP listen address (127.0.0.1:4xxxx)
+	trafficStatsAddr string // hysteria trafficStats listen address (127.0.0.1:4xxxx)
+	debug            bool
+	startTime        time.Time
+	lastConfigUpdate time.Time
 }
 
-const banner = `
- _               _            _
-| |_ _   _ ___| |_ ___ _ __(_) __ _
-| __| | | / __| __/ _ \ '__| |/ _' |
-| |_| |_| \__ \ ||  __/ |  | | (_| |
- \__|\__, |___/\__\___|_|  |_|\__,_|
-     |___/
-      _                _                  _
-     | |__   __ _  ___| | _____ _ __   __| |
-     | '_ \ / _' |/ __| |/ / _ \ '_ \ / _' |
-     | |_) | (_| | (__|   <  __/ | | | (_| |
-     |_.__/ \__,_|\___|_|\_\___|_| |_|\__,_|
+func generateSecret() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("[FATAL] failed to generate secret: %v", err)
+	}
+	return hex.EncodeToString(b)
+}
 
-  Hysteria proxy authentication & traffic manager
-`
+func randomAddr() string {
+	b := make([]byte, 2)
+	rand.Read(b)
+	port := 40000 + int(uint16(b[0])<<8|uint16(b[1]))%10000
+	return fmt.Sprintf("127.0.0.1:%d", port)
+}
 
 func main() {
 	flag.Usage = func() {
@@ -72,19 +111,10 @@ func main() {
 		flag.PrintDefaults()
 	}
 
-	centralServerAuth := flag.String("central-server-auth", "", "URL to GET the authentication user list (e.g. http://10.0.0.1:8080/users)")
-	centralServerTraffic := flag.String("central-server-traffic", "", "URL to POST accumulated traffic (e.g. http://10.0.0.1:8080/traffic)")
-	proxyServer := flag.String("proxy-server", "127.0.0.1:9000", "Hysteria proxy API address (ip:port)")
-	trafficServer := flag.String("traffic-server", "127.0.0.1:9000", "Hysteria traffic API address (ip:port)")
-	secret := flag.String("secret", "abcdefg", "API secret for proxy/traffic server")
-	serverID := flag.String("server-id", "", "Server ID sent to central server as path segment")
-	listenAddr := flag.String("listen", ":8080", "Listen address for the local auth API")
-
-	intervalAuth := flag.Duration("interval-auth", 10*time.Second, "Interval to refresh auth list from central server")
-	intervalKick := flag.Duration("interval-kick", 10*time.Second, "Interval to check and kick unauthorized users")
-	intervalTrafficFromProxy := flag.Duration("interval-traffic-from-proxy", 10*time.Second, "Interval to fetch traffic from proxy")
-	intervalTrafficToCentral := flag.Duration("interval-traffic-to-central", 10*time.Second, "Interval to report traffic to central server")
-	debug := flag.Bool("debug", false, "Enable debug logging (show response bodies for all requests)")
+	serverID := flag.String("server-id", "", "Server token (required)")
+	centralServer := flag.String("central-server", "", "Central server base URL (required, e.g. https://central.yundong.dev)")
+	debug := flag.Bool("debug", false, "Enable debug logging")
+	intervalConfigFromCentral := flag.Duration("interval-config-from-central", 10*time.Second, "Interval to fetch config from central server")
 
 	flag.Parse()
 
@@ -92,85 +122,339 @@ func main() {
 
 	// Validate required flags.
 	var missing []string
-	if *centralServerAuth == "" {
-		missing = append(missing, "  -central-server-auth: URL to GET the authentication user list (e.g. -central-server-auth http://10.0.0.1:8080/users)")
-	}
-	if *centralServerTraffic == "" {
-		missing = append(missing, "  -central-server-traffic: URL to POST accumulated traffic (e.g. -central-server-traffic http://10.0.0.1:8080/traffic)")
-	}
 	if *serverID == "" {
-		missing = append(missing, "  -server-id: Server ID sent to central server as path segment (e.g. -server-id my-server-1)")
+		missing = append(missing, "  -server-id: Server token (from central admin dashboard)")
+	}
+	if *centralServer == "" {
+		missing = append(missing, "  -central-server: Central server base URL (e.g. -central-server https://central.yundong.dev)")
 	}
 	if len(missing) > 0 {
-		log.Fatalf("missing required flags:\n%s", strings.Join(missing, "\n"))
+		log.Fatalf("[FATAL] missing required flags:\n%s", strings.Join(missing, "\n"))
 	}
+
+	secret := generateSecret()
+	log.Printf("[INFO] generated secret: %s...%s", secret[:8], secret[len(secret)-8:])
+
+	listenAddr := randomAddr()
+	trafficStatsAddr := randomAddr()
+	log.Printf("[INFO] backend listen address: %s", listenAddr)
+	log.Printf("[INFO] proxy stat API address: %s", trafficStatsAddr)
+
+	// Check if Hysteria is installed; auto-install if not.
+	ensureHysteriaInstalled(*debug)
+
+	// Fetch initial config from central.
+	centralBase := strings.TrimRight(*centralServer, "/")
+	cfg, err := fetchConfig(centralBase, *serverID, *debug)
+	if err != nil {
+		log.Fatalf("[FATAL] failed to fetch initial config: %v", err)
+	}
+	log.Printf("[INFO] fetched initial config from central: acme_domain=%s", cfg.AcmeDomain)
 
 	app := &App{
-		authList:             make(map[string]bool),
-		trafficTable:         make(map[string]*TrafficStats),
-		proxyServer:          *proxyServer,
-		centralServerAuth:    *centralServerAuth,
-		centralServerTraffic: *centralServerTraffic,
-		trafficServer:        *trafficServer,
-		secret:               *secret,
-		serverID: *serverID,
-		debug:    *debug,
+		authList:         make(map[string]bool),
+		trafficTable:     make(map[string]*TrafficStats),
+		config:           *cfg,
+		centralServer:    centralBase,
+		serverID:         *serverID,
+		secret:           secret,
+		listenAddr:       listenAddr,
+		trafficStatsAddr: trafficStatsAddr,
+		debug:            *debug,
+		startTime:        time.Now(),
+		lastConfigUpdate: time.Now(),
 	}
 
-	// Start periodic background tasks.
-	go app.periodicAuthFetch(*intervalAuth)
-	go app.periodicKickCheck(*intervalKick)
-	go app.periodicTrafficFetch(*intervalTrafficFromProxy)
-	go app.periodicTrafficReport(*intervalTrafficToCentral)
+	// Write Hysteria config and start the service (retry with new ports on conflict).
+	app.startWithRetry()
 
-	// Start the local auth HTTP server.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", app.handleAuth)
+	// Start background goroutines.
+	go app.periodicConfigFetch(*intervalConfigFromCentral)
+	go app.periodicAuthFetch()
+	go app.periodicKickCheck()
+	go app.periodicTrafficFetch()
+	go app.periodicTrafficReport()
+	go app.periodicStatusReport(*intervalConfigFromCentral)
 
-	log.Printf("auth server listening on %s", *listenAddr)
-	log.Fatal(http.ListenAndServe(*listenAddr, mux))
+	// Start the local auth HTTP server (retry with new port on conflict).
+	app.startHTTPServerWithRetry()
 }
 
 // ---------------------------------------------------------------------------
-// 1. Periodic auth list fetch from central server
+// Hysteria installation and management
 // ---------------------------------------------------------------------------
 
-func (a *App) periodicAuthFetch(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+func ensureHysteriaInstalled(debug bool) {
+	path, err := exec.LookPath("hysteria")
+	if err == nil {
+		if debug {
+			log.Printf("[DEBUG] hysteria found at %s", path)
+		}
+		log.Printf("[INFO] hysteria is installed")
+		return
+	}
 
-	a.fetchAuthList() // run once immediately
-	for range ticker.C {
+	log.Printf("[INFO] hysteria not found, installing...")
+	cmd := exec.Command("bash", "-c", "curl -fsSL https://get.hy2.sh/ | bash")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("[FATAL] failed to install hysteria: %v", err)
+	}
+	log.Printf("[INFO] hysteria installed successfully")
+}
+
+func (a *App) writeHysteriaConfig() error {
+	a.configMu.RLock()
+	cfg := a.config
+	a.configMu.RUnlock()
+
+	_, listenPort, _ := net.SplitHostPort(a.listenAddr)
+	_, trafficPort, _ := net.SplitHostPort(a.trafficStatsAddr)
+
+	yaml := fmt.Sprintf(`acme:
+  domains:
+    - %s
+  email: %s
+
+auth:
+  type: http
+  http:
+    url: http://127.0.0.1:%s/
+
+trafficStats:
+  listen: :%s
+  secret: %s
+`, cfg.AcmeDomain, cfg.AcmeEmail, listenPort, trafficPort, a.secret)
+
+	// Ensure directory exists.
+	if err := os.MkdirAll("/etc/hysteria", 0755); err != nil {
+		return fmt.Errorf("create /etc/hysteria: %w", err)
+	}
+
+	if err := os.WriteFile("/etc/hysteria/config.yaml", []byte(yaml), 0644); err != nil {
+		return fmt.Errorf("write config.yaml: %w", err)
+	}
+
+	log.Printf("[INFO] wrote /etc/hysteria/config.yaml (domain=%s, auth_port=%s, stats_port=%s)", cfg.AcmeDomain, listenPort, trafficPort)
+	return nil
+}
+
+func restartHysteria() error {
+	cmd := exec.Command("systemctl", "restart", "hysteria-server.service")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemctl restart: %v: %s", err, string(out))
+	}
+	log.Printf("[INFO] restarted hysteria-server.service")
+	return nil
+}
+
+func getHysteriaPath() string {
+	// Try to get the binary path from the systemd service.
+	out, err := exec.Command("systemctl", "show", "-p", "ExecStart", "hysteria-server.service").CombinedOutput()
+	if err == nil {
+		// Output format: ExecStart={ path=/usr/local/bin/hysteria ; ... }
+		s := string(out)
+		if idx := strings.Index(s, "path="); idx >= 0 {
+			s = s[idx+5:]
+			if end := strings.IndexAny(s, " ;}\n"); end >= 0 {
+				p := strings.TrimSpace(s[:end])
+				if p != "" {
+					return p
+				}
+			}
+		}
+	}
+	// Fallback to PATH lookup.
+	if p, err := exec.LookPath("hysteria"); err == nil {
+		return p
+	}
+	return "hysteria"
+}
+
+func getHysteriaVersion() string {
+	bin := getHysteriaPath()
+	out, err := exec.Command(bin, "version").CombinedOutput()
+	if err != nil {
+		return "unknown"
+	}
+	// Parse the "Version:" line from the output.
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Version:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "Version:"))
+		}
+	}
+	return "unknown"
+}
+
+// ---------------------------------------------------------------------------
+// Config fetch from central
+// ---------------------------------------------------------------------------
+
+func fetchConfig(centralBase, serverID string, debug bool) (*ServerConfig, error) {
+	url := centralBase + "/backend/config/" + serverID
+	if debug {
+		log.Printf("[DEBUG] config fetch: GET %s", url)
+	}
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GET %s: status %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var cfg ServerConfig
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	return &cfg, nil
+}
+
+func (a *App) periodicConfigFetch(interval time.Duration) {
+	for {
+		time.Sleep(interval)
+
+		cfg, err := fetchConfig(a.centralServer, a.serverID, a.debug)
+		if err != nil {
+			log.Printf("[INFO] config fetch error: %v", err)
+			continue
+		}
+
+		a.configMu.Lock()
+		old := a.config
+		a.config = *cfg
+		a.lastConfigUpdate = time.Now()
+		a.configMu.Unlock()
+
+		// Check if Hysteria-relevant config changed (ACME settings).
+		if old.AcmeDomain != cfg.AcmeDomain || old.AcmeEmail != cfg.AcmeEmail {
+			log.Printf("[INFO] hysteria config changed, rewriting and restarting")
+			if err := a.writeHysteriaConfig(); err != nil {
+				log.Printf("[INFO] failed to write hysteria config: %v", err)
+			} else if err := restartHysteria(); err != nil {
+				log.Printf("[INFO] failed to restart hysteria: %v", err)
+			}
+		}
+
+		if a.debug {
+			log.Printf("[DEBUG] config updated: %+v", cfg)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Startup with port-conflict retry
+// ---------------------------------------------------------------------------
+
+func (a *App) startWithRetry() {
+	for {
+		if err := a.writeHysteriaConfig(); err != nil {
+			log.Fatalf("[FATAL] failed to write hysteria config: %v", err)
+		}
+		err := restartHysteria()
+		if err == nil {
+			return
+		}
+		// Assume port conflict — pick a new trafficStats port and retry.
+		a.trafficStatsAddr = randomAddr()
+		log.Printf("[INFO] hysteria failed to start, retrying with new proxy stat API address: %s", a.trafficStatsAddr)
+	}
+}
+
+func (a *App) startHTTPServerWithRetry() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", a.handleAuth)
+
+	for {
+		srv := &http.Server{Addr: a.listenAddr, Handler: mux}
+		log.Printf("[INFO] backend listen address: %s", a.listenAddr)
+		err := srv.ListenAndServe()
+		if err == nil {
+			return
+		}
+		// Assume port conflict — pick a new listen port and retry.
+		a.listenAddr = randomAddr()
+		log.Printf("[INFO] listen failed (%v), retrying with new address: %s", err, a.listenAddr)
+		// Rewrite hysteria config so it points to the new auth port.
+		if err := a.writeHysteriaConfig(); err != nil {
+			log.Printf("[INFO] failed to rewrite hysteria config: %v", err)
+		} else {
+			restartHysteria()
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Auth fetch from central
+// ---------------------------------------------------------------------------
+
+func (a *App) centralAuthURL() string {
+	a.configMu.RLock()
+	u := a.config.AuthURL
+	a.configMu.RUnlock()
+	if u == "" {
+		u = a.centralServer + "/backend/auth"
+	}
+	return strings.TrimRight(u, "/") + "/" + a.serverID
+}
+
+func (a *App) centralTrafficURL() string {
+	a.configMu.RLock()
+	u := a.config.TrafficURL
+	a.configMu.RUnlock()
+	if u == "" {
+		u = a.centralServer + "/backend/traffic"
+	}
+	return strings.TrimRight(u, "/") + "/" + a.serverID
+}
+
+func (a *App) periodicAuthFetch() {
+	a.fetchAuthList()
+	for {
+		a.configMu.RLock()
+		d, _ := time.ParseDuration(a.config.IntervalAuth)
+		a.configMu.RUnlock()
+		if d <= 0 {
+			d = 10 * time.Second
+		}
+		time.Sleep(d)
 		a.fetchAuthList()
 	}
 }
 
-func (a *App) centralURL(base string) string {
-	return strings.TrimRight(base, "/") + "/" + a.serverID
-}
-
 func (a *App) fetchAuthList() {
-	resp, err := http.Get(a.centralURL(a.centralServerAuth))
+	url := a.centralAuthURL()
+	if a.debug {
+		log.Printf("[DEBUG] auth fetch: GET %s", url)
+	}
+	resp, err := http.Get(url)
 	if err != nil {
-		log.Printf("auth fetch error: %v", err)
+		log.Printf("[INFO] auth fetch error: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("auth fetch: central server returned %d", resp.StatusCode)
+		log.Printf("[INFO] auth fetch: central server returned %d (url: %s)", resp.StatusCode, url)
 		return
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("auth fetch: read body error: %v", err)
+		log.Printf("[INFO] auth fetch: read body error: %v", err)
 		return
 	}
 
 	var users []string
 	if err := json.Unmarshal(body, &users); err != nil {
-		log.Printf("auth fetch: json decode error: %v", err)
+		log.Printf("[INFO] auth fetch: json decode error: %v", err)
 		return
 	}
 
@@ -183,57 +467,65 @@ func (a *App) fetchAuthList() {
 	a.authList = newList
 	a.authMu.Unlock()
 
-	log.Printf("auth list updated: %d users", len(newList))
+	log.Printf("[INFO] auth list updated: %d users", len(newList))
 	if a.debug {
 		log.Printf("[DEBUG] auth list: %v", users)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// 2. Periodic kick check against proxy server
+// Kick check
 // ---------------------------------------------------------------------------
 
-func (a *App) periodicKickCheck(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
+func (a *App) periodicKickCheck() {
+	for {
+		a.configMu.RLock()
+		d, _ := time.ParseDuration(a.config.IntervalKick)
+		a.configMu.RUnlock()
+		if d <= 0 {
+			d = 10 * time.Second
+		}
+		time.Sleep(d)
 		a.kickUnauthorized()
 	}
 }
 
+func (a *App) trafficServerAddr() string {
+	return a.trafficStatsAddr
+}
+
 func (a *App) kickUnauthorized() {
-	// GET /online from proxy
-	req, _ := http.NewRequest("GET", fmt.Sprintf("http://%s/online", a.proxyServer), nil)
+	addr := a.trafficServerAddr()
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://%s/online", addr), nil)
 	req.Header.Set("Authorization", a.secret)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("kick check: GET /online error: %v", err)
+		log.Printf("[INFO] kick check: GET /online error: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusUnauthorized {
-			log.Printf("kick check: /online returned 401 Unauthorized. Make sure the -secret flag matches the trafficStats secret in the Hysteria server config.")
+			log.Printf("[INFO] kick check: /online returned 401 Unauthorized. Check that the secret matches the Hysteria trafficStats config.")
 		} else {
-			log.Printf("kick check: /online returned %d", resp.StatusCode)
+			log.Printf("[INFO] kick check: /online returned %d", resp.StatusCode)
 		}
 		return
 	}
 
 	var online map[string]int
 	if err := json.NewDecoder(resp.Body).Decode(&online); err != nil {
-		log.Printf("kick check: decode /online error: %v", err)
+		log.Printf("[INFO] kick check: decode /online error: %v", err)
 		return
 	}
 
+	log.Printf("[INFO] online: %d users", len(online))
 	if a.debug {
-		log.Printf("[DEBUG] GET /online: %d users online: %v", len(online), online)
+		log.Printf("[DEBUG] GET /online: %v", online)
 	}
 
-	// Build list of users to kick.
 	a.authMu.RLock()
 	var toKick []string
 	for user := range online {
@@ -247,30 +539,29 @@ func (a *App) kickUnauthorized() {
 		return
 	}
 
-	log.Printf("kicking %d unauthorized users: %v", len(toKick), toKick)
+	log.Printf("[INFO] kicking %d unauthorized users: %v", len(toKick), toKick)
 
-	// POST /kick to proxy
 	body, _ := json.Marshal(toKick)
-	kickReq, _ := http.NewRequest("POST", fmt.Sprintf("http://%s/kick", a.proxyServer), bytes.NewReader(body))
+	kickReq, _ := http.NewRequest("POST", fmt.Sprintf("http://%s/kick", addr), bytes.NewReader(body))
 	kickReq.Header.Set("Authorization", a.secret)
 	kickReq.Header.Set("Content-Type", "application/json")
 
 	kickResp, err := http.DefaultClient.Do(kickReq)
 	if err != nil {
-		log.Printf("kick check: POST /kick error: %v", err)
+		log.Printf("[INFO] kick check: POST /kick error: %v", err)
 		return
 	}
 	kickResp.Body.Close()
 
 	if kickResp.StatusCode != http.StatusOK {
-		log.Printf("kick check: /kick returned %d", kickResp.StatusCode)
-	} else if a.debug {
-		log.Printf("[DEBUG] POST /kick: successfully kicked %d users", len(toKick))
+		log.Printf("[INFO] kick check: /kick returned %d", kickResp.StatusCode)
+	} else {
+		log.Printf("[INFO] kicked %d unauthorized users: %v", len(toKick), toKick)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// 4. Local auth API (Hysteria HTTP authentication backend)
+// Local auth API (Hysteria HTTP authentication backend)
 // ---------------------------------------------------------------------------
 
 func (a *App) handleAuth(w http.ResponseWriter, r *http.Request) {
@@ -307,41 +598,46 @@ func (a *App) handleAuth(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Periodic traffic fetch from proxy/traffic server
+// Traffic fetch from Hysteria
 // ---------------------------------------------------------------------------
 
-func (a *App) periodicTrafficFetch(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
+func (a *App) periodicTrafficFetch() {
+	for {
+		a.configMu.RLock()
+		d, _ := time.ParseDuration(a.config.IntervalTrafficFromProxy)
+		a.configMu.RUnlock()
+		if d <= 0 {
+			d = 10 * time.Second
+		}
+		time.Sleep(d)
 		a.fetchTraffic()
 	}
 }
 
 func (a *App) fetchTraffic() {
-	req, _ := http.NewRequest("GET", fmt.Sprintf("http://%s/traffic?clear=1", a.trafficServer), nil)
+	addr := a.trafficServerAddr()
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://%s/traffic?clear=1", addr), nil)
 	req.Header.Set("Authorization", a.secret)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("traffic fetch: error: %v", err)
+		log.Printf("[INFO] traffic fetch: error: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusUnauthorized {
-			log.Printf("traffic fetch: returned 401 Unauthorized. Make sure the -secret flag matches the trafficStats secret in the Hysteria server config.")
+			log.Printf("[INFO] traffic fetch: returned 401 Unauthorized. Check that the secret matches the Hysteria trafficStats config.")
 		} else {
-			log.Printf("traffic fetch: returned %d", resp.StatusCode)
+			log.Printf("[INFO] traffic fetch: returned %d", resp.StatusCode)
 		}
 		return
 	}
 
 	var stats map[string]*TrafficStats
 	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-		log.Printf("traffic fetch: decode error: %v", err)
+		log.Printf("[INFO] traffic fetch: decode error: %v", err)
 		return
 	}
 
@@ -352,7 +648,6 @@ func (a *App) fetchTraffic() {
 		}
 	}
 
-	// Accumulate into our traffic table.
 	a.trafficMu.Lock()
 	for user, s := range stats {
 		existing, ok := a.trafficTable[user]
@@ -367,21 +662,23 @@ func (a *App) fetchTraffic() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Periodic traffic report to central server
+// Traffic report to central
 // ---------------------------------------------------------------------------
 
-func (a *App) periodicTrafficReport(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
+func (a *App) periodicTrafficReport() {
+	for {
+		a.configMu.RLock()
+		d, _ := time.ParseDuration(a.config.IntervalTrafficToCentral)
+		a.configMu.RUnlock()
+		if d <= 0 {
+			d = 10 * time.Second
+		}
+		time.Sleep(d)
 		a.reportTraffic()
 	}
 }
 
 func (a *App) reportTraffic() {
-	// Atomically swap the traffic table with a fresh one so concurrent
-	// fetches (step 5) write into the new table while we send the old one.
 	a.trafficMu.Lock()
 	snapshot := a.trafficTable
 	a.trafficTable = make(map[string]*TrafficStats)
@@ -391,19 +688,33 @@ func (a *App) reportTraffic() {
 		return
 	}
 
+	// Only send users with non-zero traffic to minimize load.
+	filtered := make(map[string]*TrafficStats, len(snapshot))
+	for user, s := range snapshot {
+		if s.TX > 0 || s.RX > 0 {
+			filtered[user] = s
+		}
+	}
+	if len(filtered) == 0 {
+		return
+	}
+	snapshot = filtered
+
+	url := a.centralTrafficURL()
+	if a.debug {
+		log.Printf("[DEBUG] traffic report: POST %s", url)
+	}
 	body, _ := json.Marshal(snapshot)
-	resp, err := http.Post(a.centralURL(a.centralServerTraffic), "application/json", bytes.NewReader(body))
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
-		log.Printf("traffic report: POST error: %v", err)
-		// Merge snapshot back so data is not lost.
+		log.Printf("[INFO] traffic report: POST error: %v", err)
 		a.mergeTraffic(snapshot)
 		return
 	}
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("traffic report: central returned %d, keeping data", resp.StatusCode)
-		// Merge snapshot back so data is not lost.
+		log.Printf("[INFO] traffic report: central returned %d, keeping data", resp.StatusCode)
 		a.mergeTraffic(snapshot)
 	} else if a.debug {
 		log.Printf("[DEBUG] POST traffic report: sent %d users to central server", len(snapshot))
@@ -413,8 +724,6 @@ func (a *App) reportTraffic() {
 	}
 }
 
-// mergeTraffic adds a snapshot back into the live traffic table (used when
-// the central server did not accept the report).
 func (a *App) mergeTraffic(snapshot map[string]*TrafficStats) {
 	a.trafficMu.Lock()
 	defer a.trafficMu.Unlock()
@@ -427,5 +736,45 @@ func (a *App) mergeTraffic(snapshot map[string]*TrafficStats) {
 			existing.TX += s.TX
 			existing.RX += s.RX
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Status report to central
+// ---------------------------------------------------------------------------
+
+func (a *App) periodicStatusReport(interval time.Duration) {
+	hysteriaVersion := getHysteriaVersion()
+	for {
+		time.Sleep(interval)
+		a.reportStatus(hysteriaVersion)
+	}
+}
+
+func (a *App) reportStatus(hysteriaVersion string) {
+	a.configMu.RLock()
+	lastCfg := a.lastConfigUpdate
+	a.configMu.RUnlock()
+
+	url := a.centralServer + "/backend/status/" + a.serverID
+	body, _ := json.Marshal(map[string]interface{}{
+		"status":             "active",
+		"hysteria_version":   hysteriaVersion,
+		"backend_version":    backendVersion,
+		"last_config_update": lastCfg.UTC().Format(time.RFC3339),
+		"uptime_seconds":     int64(time.Since(a.startTime).Seconds()),
+	})
+
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[INFO] status report: POST error: %v", err)
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[INFO] status report: central returned %d", resp.StatusCode)
+	} else if a.debug {
+		log.Printf("[DEBUG] status reported to central (uptime=%ds)", int64(time.Since(a.startTime).Seconds()))
 	}
 }
