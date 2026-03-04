@@ -3,13 +3,17 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -29,11 +33,18 @@ const banner = `
   Hysteria central management server
 `
 
+const (
+	adminSessionCookieName       = "hysteria_admin_session"
+	userSessionCookieName        = "hysteria_user_token"
+	maxJSONBodyBytes       int64 = 1 << 20
+)
+
 type Server struct {
 	db            *sql.DB
 	debug         bool
 	baseURL       string
 	adminToken    string
+	adminSession  string
 	cfAPIToken    string
 	cfZoneID      string
 	doToken       string
@@ -97,14 +108,25 @@ func main() {
 
 	flag.Parse()
 
+	log.SetFlags(log.Ldate | log.Ltime)
+
 	if *adminToken == "" {
-		b := make([]byte, 8)
-		rand.Read(b)
-		*adminToken = fmt.Sprintf("%x", b)
-		log.Printf("[INFO] generated admin token: %s", *adminToken)
+		tok, err := randomHex(32)
+		if err != nil {
+			log.Fatalf("[FATAL] failed to generate admin token: %v", err)
+		}
+		*adminToken = tok
+		const tokenFile = "central.admin.token"
+		if err := os.WriteFile(tokenFile, []byte(tok+"\n"), 0600); err != nil {
+			log.Fatalf("[FATAL] failed to persist generated admin token: %v", err)
+		}
+		log.Printf("[INFO] generated admin token and wrote it to %s (mode 0600)", tokenFile)
 	}
 
-	log.SetFlags(log.Ldate | log.Ltime)
+	adminSession, err := randomHex(32)
+	if err != nil {
+		log.Fatalf("[FATAL] failed to generate admin session secret: %v", err)
+	}
 
 	db, err := sql.Open("sqlite", *dbPath)
 	if err != nil {
@@ -126,6 +148,7 @@ func main() {
 		debug:         *debug,
 		baseURL:       strings.TrimRight(*baseURL, "/"),
 		adminToken:    *adminToken,
+		adminSession:  adminSession,
 		cfAPIToken:    *cfAPIToken,
 		cfZoneID:      *cfZoneID,
 		doToken:       *doToken,
@@ -147,20 +170,84 @@ func main() {
 	mux := http.NewServeMux()
 
 	// Backend APIs (called by hysteria-backend nodes)
-	mux.HandleFunc("/backend/auth/", srv.handleAuth)
-	mux.HandleFunc("/backend/traffic/", srv.handleTraffic)
-	mux.HandleFunc("/backend/config/", srv.handleServerConfig)
-	mux.HandleFunc("/backend/status/", srv.handleServerStatus)
+	mux.HandleFunc("/backend/auth", srv.handleAuth)
+	mux.HandleFunc("/backend/traffic", srv.handleTraffic)
+	mux.HandleFunc("/backend/config", srv.handleServerConfig)
+	mux.HandleFunc("/backend/status", srv.handleServerStatus)
 
 	// User-facing
+	mux.HandleFunc("/user", srv.handleUser)
 	mux.HandleFunc("/user/", srv.handleUser)
 
-	// Admin (token-gated)
+	// Admin
+	mux.HandleFunc("/admin", srv.handleAdmin)
 	mux.HandleFunc("/admin/", srv.handleAdmin)
 
-	log.Printf("[INFO] admin dashboard: http://localhost%s/admin/%s/", *listenAddr, srv.adminToken)
+	log.Printf("[INFO] admin dashboard: http://localhost%s/admin", *listenAddr)
 	log.Printf("[INFO] central server listening on %s (db: %s)", *listenAddr, *dbPath)
 	log.Fatal(http.ListenAndServe(*listenAddr, mux))
+}
+
+func randomHex(numBytes int) (string, error) {
+	if numBytes <= 0 {
+		return "", fmt.Errorf("invalid random length: %d", numBytes)
+	}
+	b := make([]byte, numBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// isValidIP checks that s is a well-formed IPv4 or IPv6 address.
+// Used to prevent command injection via crafted IP values in SSH/rsync args.
+func isValidIP(s string) bool {
+	return net.ParseIP(s) != nil
+}
+
+// isSafeShellArg checks that a string is safe to embed as a systemd ExecStart
+// argument (no shell metacharacters, newlines, or control characters).
+func isSafeShellArg(s string) bool {
+	for _, c := range s {
+		if c < 0x20 || c == '\x7f' {
+			return false // control characters / newlines
+		}
+		switch c {
+		case '`', '$', '\\', '"', '\'', ';', '&', '|', '(', ')', '{', '}', '<', '>', '!', '#':
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+func isSecureRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	proto := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0])
+	return strings.EqualFold(proto, "https")
+}
+
+func writeSessionCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isSecureRequest(r),
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   maxAge,
+	})
+}
+
+func readBearerToken(r *http.Request) string {
+	if auth := strings.TrimSpace(r.Header.Get("Authorization")); auth != "" {
+		const prefix = "bearer "
+		if len(auth) >= len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix) {
+			return strings.TrimSpace(auth[len(prefix):])
+		}
+	}
+	return strings.TrimSpace(r.Header.Get("X-Server-Token"))
 }
 
 func initDB(db *sql.DB) error {
@@ -324,8 +411,14 @@ var idNouns = []string{
 
 func generateServerID(db *sql.DB) string {
 	for {
-		ai, _ := rand.Int(rand.Reader, big.NewInt(int64(len(idAdjectives))))
-		ni, _ := rand.Int(rand.Reader, big.NewInt(int64(len(idNouns))))
+		ai, err := rand.Int(rand.Reader, big.NewInt(int64(len(idAdjectives))))
+		if err != nil {
+			continue
+		}
+		ni, err := rand.Int(rand.Reader, big.NewInt(int64(len(idNouns))))
+		if err != nil {
+			continue
+		}
 		id := idAdjectives[ai.Int64()] + "-" + idNouns[ni.Int64()]
 		var exists int
 		db.QueryRow("SELECT COUNT(*) FROM servers WHERE id = ?", id).Scan(&exists)
@@ -337,9 +430,10 @@ func generateServerID(db *sql.DB) string {
 
 func generateToken(db *sql.DB) string {
 	for {
-		b := make([]byte, 8)
-		rand.Read(b)
-		tok := fmt.Sprintf("%x", b)
+		tok, err := randomHex(16)
+		if err != nil {
+			continue
+		}
 		var exists int
 		db.QueryRow("SELECT COUNT(*) FROM users WHERE token = ?", tok).Scan(&exists)
 		if exists > 0 {
@@ -353,49 +447,119 @@ func generateToken(db *sql.DB) string {
 }
 
 // ---------------------------------------------------------------------------
-// /user/{user_id} — user overview page
-// /user/{user_id}/sub/shadowrocket/ — subscription file (hysteria2 URIs)
+// User portal + subscriptions (session-cookie authenticated)
 // ---------------------------------------------------------------------------
 
-func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+func (s *Server) setUserSession(w http.ResponseWriter, r *http.Request, token string) {
+	writeSessionCookie(w, r, userSessionCookieName, token, 30*24*60*60)
+}
+
+func (s *Server) clearUserSession(w http.ResponseWriter, r *http.Request) {
+	writeSessionCookie(w, r, userSessionCookieName, "", -1)
+}
+
+func (s *Server) resolveUserSession(r *http.Request) (userID, userToken string, ok bool) {
+	c, err := r.Cookie(userSessionCookieName)
+	if err != nil || strings.TrimSpace(c.Value) == "" {
+		return "", "", false
+	}
+	userToken = strings.TrimSpace(c.Value)
+	if err := s.db.QueryRow("SELECT id FROM users WHERE token = ?", userToken).Scan(&userID); err != nil {
+		return "", "", false
+	}
+	return userID, userToken, true
+}
+
+func (s *Server) handleUserLoginSubmit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	path := strings.TrimPrefix(r.URL.Path, "/user/")
-	parts := strings.SplitN(path, "/", 3) // token [, "sub" [, "shadowrocket/"]]
-	if len(parts) == 0 || parts[0] == "" {
-		s.handleUserLogin(w, r, false)
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	token := parts[0]
-
-	// Look up user by token.
+	token := strings.TrimSpace(body.Token)
+	if token == "" {
+		http.Error(w, "missing token", http.StatusBadRequest)
+		return
+	}
 	var userID string
 	if err := s.db.QueryRow("SELECT id FROM users WHERE token = ?", token).Scan(&userID); err != nil {
-		s.handleUserLogin(w, r, true)
+		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
+	s.setUserSession(w, r, token)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUserLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.clearUserSession(w, r)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/user", "/user/":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		userID, userToken, ok := s.resolveUserSession(r)
+		if !ok {
+			s.handleUserLogin(w, r, false)
+			return
+		}
+		s.handleUserPage(w, r, userID, userToken)
+		return
+
+	case "/user/login":
+		s.handleUserLoginSubmit(w, r)
+		return
+
+	case "/user/logout":
+		s.handleUserLogout(w, r)
+		return
+
+	case "/user/sub/shadowrocket", "/user/sub/shadowrocket/":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		userID, userToken, ok := s.resolveUserSession(r)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		s.handleSubShadowrocket(w, r, userID, userToken)
+		return
+
+	case "/user/sub/clash", "/user/sub/clash/":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		userID, userToken, ok := s.resolveUserSession(r)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		s.handleSubClash(w, r, userID, userToken)
 		return
 	}
 
-	// /user/{token}/sub/shadowrocket/
-	if len(parts) >= 3 && parts[1] == "sub" && strings.TrimSuffix(parts[2], "/") == "shadowrocket" {
-		s.handleSubShadowrocket(w, r, userID, token)
+	if strings.HasPrefix(r.URL.Path, "/user/") {
+		http.Error(w, "token-in-url access removed; use /user login", http.StatusGone)
 		return
 	}
-
-	// /user/{token}/sub/clash/
-	if len(parts) >= 3 && parts[1] == "sub" && strings.TrimSuffix(parts[2], "/") == "clash" {
-		s.handleSubClash(w, r, userID, token)
-		return
-	}
-
-	// /user/{token} — overview page
-	if len(parts) == 1 || (len(parts) == 2 && parts[1] == "") {
-		s.handleUserPage(w, r, userID, token)
-		return
-	}
-
 	http.NotFound(w, r)
 }
 
@@ -436,6 +600,25 @@ func (s *Server) queryUserServers(userID string) ([]userServerInfo, error) {
 	return servers, nil
 }
 
+func (s *Server) isUserAssignedToServer(serverID, userID string) (bool, error) {
+	var allowed int
+	err := s.db.QueryRow(`
+		SELECT CASE WHEN (
+			EXISTS (SELECT 1 FROM server_users su WHERE su.server_id = ? AND su.user_id = ?)
+			OR EXISTS (
+				SELECT 1 FROM server_groups sg
+				JOIN group_users gu ON gu.group_name = sg.group_name
+				WHERE sg.server_id = ? AND gu.user_id = ?
+			)
+			OR EXISTS (SELECT 1 FROM group_users gu WHERE gu.group_name = 'all' AND gu.user_id = ?)
+		) THEN 1 ELSE 0 END
+	`, serverID, userID, serverID, userID, userID).Scan(&allowed)
+	if err != nil {
+		return false, err
+	}
+	return allowed == 1, nil
+}
+
 // GET /user/{id}/sub/shadowrocket/ — plain text subscription
 func (s *Server) handleSubShadowrocket(w http.ResponseWriter, r *http.Request, userID string, userToken string) {
 	var exists int
@@ -464,7 +647,7 @@ func (s *Server) handleSubShadowrocket(w http.ResponseWriter, r *http.Request, u
 	fmt.Fprint(w, strings.Join(lines, "\n"))
 }
 
-// GET /user/{token}/sub/clash/ — Clash YAML subscription
+// GET /user/sub/clash — Clash YAML subscription
 func (s *Server) handleSubClash(w http.ResponseWriter, r *http.Request, userID string, userToken string) {
 	var exists int
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM users WHERE id = ?", userID).Scan(&exists); err != nil || exists == 0 {
@@ -501,7 +684,14 @@ func (s *Server) handleSubClash(w http.ResponseWriter, r *http.Request, userID s
 
 	log.Printf("[INFO] GET /user/%s/sub/clash/: %d servers", userID, len(servers))
 	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
-	w.Header().Set("Content-Disposition", "attachment; filename="+userID+".yaml")
+	// Sanitize filename to prevent header injection: strip control chars, quotes, and backslashes.
+	safeID := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == '"' || r == '\\' || r == '\x7f' {
+			return '_'
+		}
+		return r
+	}, userID)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeID+`.yaml"`)
 	fmt.Fprintf(w, `port: 7890
 allow-lan: true
 mode: rule
@@ -606,14 +796,27 @@ func (s *Server) handleUserLogin(w http.ResponseWriter, r *http.Request, invalid
 function go(e) {
   e.preventDefault();
   var t = document.getElementById("tok").value.trim();
-  if (t) window.location.href = "/user/" + encodeURIComponent(t);
+  if (!t) return;
+  fetch("/user/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: t })
+  }).then(function(resp) {
+    if (!resp.ok) throw new Error("invalid");
+    window.location.href = "/user";
+  }).catch(function() {
+    document.getElementById("err").textContent = "Invalid token. Please try again.";
+    var input = document.getElementById("tok");
+    input.classList.add("err");
+    input.focus();
+  });
 }
 </script>
 </body>
 </html>`, errMsg, inputClass)
 }
 
-// GET /user/{token} — user overview HTML page
+// GET /user — user overview HTML page
 func (s *Server) handleUserPage(w http.ResponseWriter, r *http.Request, userID string, userToken string) {
 	var quota int64
 	var lastSeen string
@@ -636,8 +839,14 @@ func (s *Server) handleUserPage(w http.ResponseWriter, r *http.Request, userID s
 	// Build servers JSON for embedding.
 	serversJSON, _ := json.Marshal(servers)
 
-	subURL := s.baseURL + "/user/" + userToken + "/sub/shadowrocket/"
-	clashURL := s.baseURL + "/user/" + userToken + "/sub/clash/"
+	subURL := s.baseURL + "/user/sub/shadowrocket"
+	clashURL := s.baseURL + "/user/sub/clash"
+	userIDHTML := html.EscapeString(userID)
+	userTokenHTML := html.EscapeString(userToken)
+	lastSeenJS, _ := json.Marshal(lastSeen)
+	subURLJS, _ := json.Marshal(subURL)
+	clashURLJS, _ := json.Marshal(clashURL)
+	userTokenJS, _ := json.Marshal(userToken)
 
 	total := tx + rx
 	var pct float64
@@ -648,7 +857,7 @@ func (s *Server) handleUserPage(w http.ResponseWriter, r *http.Request, userID s
 		}
 	}
 
-	log.Printf("[INFO] GET /user/%s/sub/: serving user page", userID)
+	log.Printf("[INFO] GET /user: serving user page for %s", userID)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<!DOCTYPE html>
@@ -718,11 +927,20 @@ func (s *Server) handleUserPage(w http.ResponseWriter, r *http.Request, userID s
 var GiB = 1073741824;
 var tx = %d, rx = %d, quota = %d;
 var pct = %f;
-var lastSeen = "%s";
+var lastSeen = %s;
 var servers = %s;
-var subURL = "%s";
-var clashURL = "%s";
-var userToken = "%s";
+var subURL = %s;
+var clashURL = %s;
+var userToken = %s;
+
+function escHtml(v) {
+  return String(v === undefined || v === null ? "" : v)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 function copyToken(box) {
   navigator.clipboard.writeText(userToken).then(function() {
@@ -764,7 +982,7 @@ if (!servers || servers.length === 0) {
 } else {
   var h = "";
   for (var i = 0; i < servers.length; i++) {
-    h += '<div class="server"><span class="name">' + servers[i].id + '</span><span class="domain">' + (servers[i].domain || "-") + '</span></div>';
+    h += '<div class="server"><span class="name">' + escHtml(servers[i].id) + '</span><span class="domain">' + escHtml(servers[i].domain || "-") + '</span></div>';
   }
   sh.innerHTML = h;
 }
@@ -779,27 +997,31 @@ function copySub(btn, url) {
 }
 </script>
 </body>
-</html>`, userID, userID, userToken, tx, rx, quota, pct, lastSeen, string(serversJSON), subURL, clashURL, userToken)
+</html>`, userIDHTML, userIDHTML, userTokenHTML, tx, rx, quota, pct, string(lastSeenJS), string(serversJSON), string(subURLJS), string(clashURLJS), string(userTokenJS))
 }
 
 // ---------------------------------------------------------------------------
-// GET /auth/{server_id} — return user list for a server (quota-filtered)
+// GET /backend/auth — return user list for a server (quota-filtered)
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/backend/auth" {
+		http.NotFound(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	token := strings.TrimPrefix(r.URL.Path, "/backend/auth/")
+	token := readBearerToken(r)
 	if token == "" {
-		http.Error(w, "missing server token", http.StatusBadRequest)
+		http.Error(w, "missing server token", http.StatusUnauthorized)
 		return
 	}
 	serverID := s.resolveServerToken(token)
 	if serverID == "" {
-		http.Error(w, "server not found", http.StatusNotFound)
+		http.Error(w, "invalid server token", http.StatusUnauthorized)
 		return
 	}
 
@@ -839,7 +1061,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[INFO] GET /auth/%s: %d authorized users", serverID, len(users))
 	if s.debug {
-		log.Printf("[DEBUG] GET /auth/%s: %v", serverID, users)
+		log.Printf("[DEBUG] GET /auth/%s: authorized users=%d", serverID, len(users))
 
 		// Log users excluded by quota
 		excludedRows, err := s.db.Query(`
@@ -873,7 +1095,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /traffic/{server_id} — receive and accumulate traffic
+// POST /backend/traffic — receive and accumulate traffic
 // ---------------------------------------------------------------------------
 
 type TrafficStats struct {
@@ -889,18 +1111,23 @@ type TrafficStatsWithQuota struct {
 }
 
 func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/backend/traffic" {
+		http.NotFound(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	token := strings.TrimPrefix(r.URL.Path, "/backend/traffic/")
+	token := readBearerToken(r)
 	serverID := s.resolveServerToken(token)
 	if serverID == "" {
-		http.Error(w, "server not found", http.StatusNotFound)
+		http.Error(w, "invalid server token", http.StatusUnauthorized)
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	var stats map[string]*TrafficStats
 	if err := json.NewDecoder(r.Body).Decode(&stats); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -939,10 +1166,28 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	for userKey, t := range stats {
+		if t == nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if t.TX < 0 || t.RX < 0 {
+			http.Error(w, "negative traffic is not allowed", http.StatusBadRequest)
+			return
+		}
 		// userKey is the user token (from auth endpoint). Resolve to user ID.
 		var userID string
 		if err := s.db.QueryRow("SELECT id FROM users WHERE token = ?", userKey).Scan(&userID); err != nil {
-			log.Printf("[INFO] traffic: unknown user token %s, skipping", userKey)
+			log.Printf("[INFO] traffic: unknown user token (len=%d), skipping", len(userKey))
+			continue
+		}
+		allowed, err := s.isUserAssignedToServer(serverID, userID)
+		if err != nil {
+			log.Printf("[INFO] traffic: assignment check failed for %s/%s: %v", serverID, userID, err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if !allowed {
+			log.Printf("[WARN] traffic: rejected unassigned user %s for server %s", userID, serverID)
 			continue
 		}
 		if _, err := stmt.Exec(userID, t.TX, t.RX); err != nil {
@@ -966,8 +1211,11 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[INFO] POST /traffic/%s: received traffic for %d users", serverID, len(stats))
 	if s.debug {
-		for userID, t := range stats {
-			log.Printf("[DEBUG]   %s: tx=%d rx=%d", userID, t.TX, t.RX)
+		for _, t := range stats {
+			if t == nil {
+				continue
+			}
+			log.Printf("[DEBUG] traffic sample: tx=%d rx=%d", t.TX, t.RX)
 		}
 	}
 
@@ -1005,6 +1253,7 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(users)
 
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 		var body struct {
 			ID    string `json:"id"`
 			Quota int64  `json:"quota"`
@@ -1105,6 +1354,7 @@ func (s *Server) handleAdminUserGroups(w http.ResponseWriter, r *http.Request, u
 		json.NewEncoder(w).Encode(groups)
 
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 		var body struct {
 			Group string `json:"group"`
 		}
@@ -1203,6 +1453,7 @@ func (s *Server) handleAdminServerList(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(servers)
 
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 		var cfg ServerConfig
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -1292,6 +1543,7 @@ func (s *Server) handleAdminServerCRUD(w http.ResponseWriter, r *http.Request, s
 		json.NewEncoder(w).Encode(cfg)
 
 	case http.MethodPut:
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 		var cfg ServerConfig
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -1376,9 +1628,14 @@ func (s *Server) handleAdminServerRestart(w http.ResponseWriter, r *http.Request
 		http.Error(w, "server IP not found", http.StatusBadRequest)
 		return
 	}
+	if !isValidIP(ip) {
+		log.Printf("[WARN] restart %s: invalid IP in database: %q", serverID, ip)
+		http.Error(w, "server has invalid IP", http.StatusInternalServerError)
+		return
+	}
 
 	sshKey := strings.TrimSuffix(s.doSSHKeyFile, ".pub")
-	sshOpts := []string{"-i", sshKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=10"}
+	sshOpts := []string{"-i", sshKey, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes"}
 	target := "root@" + ip
 
 	// Rsync latest backend binary.
@@ -1386,7 +1643,14 @@ func (s *Server) handleAdminServerRestart(w http.ResponseWriter, r *http.Request
 	rsyncArgs := []string{"-e", rsyncSSH, s.backendBinary, target + ":/root/backend"}
 	if out, err := exec.Command("rsync", rsyncArgs...).CombinedOutput(); err != nil {
 		log.Printf("[WARN] rsync backend to %s (%s) failed: %v: %s", serverID, ip, err, string(out))
-		http.Error(w, "rsync failed: "+string(out), http.StatusInternalServerError)
+		http.Error(w, "rsync failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Validate values before embedding in the systemd service file.
+	if !isSafeShellArg(s.baseURL) || !isSafeShellArg(serverToken) {
+		log.Printf("[WARN] restart %s: unsafe baseURL or serverToken, aborting", serverID)
+		http.Error(w, "server configuration contains unsafe characters", http.StatusInternalServerError)
 		return
 	}
 
@@ -1412,7 +1676,7 @@ systemctl daemon-reload && systemctl restart hysteria-backend.service`, serviceF
 	args := append(sshOpts, target, setupCmd)
 	if out, err := exec.Command("ssh", args...).CombinedOutput(); err != nil {
 		log.Printf("[WARN] restart backend on %s (%s) failed: %v: %s", serverID, ip, err, string(out))
-		http.Error(w, "restart failed: "+string(out), http.StatusInternalServerError)
+		http.Error(w, "restart failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -1472,6 +1736,7 @@ func (s *Server) handleAdminServerUsers(w http.ResponseWriter, r *http.Request, 
 		json.NewEncoder(w).Encode(users)
 
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 		var body struct {
 			ID string `json:"id"`
 		}
@@ -1542,6 +1807,7 @@ func (s *Server) handleAdminServerGroups(w http.ResponseWriter, r *http.Request,
 		json.NewEncoder(w).Encode(groups)
 
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 		var body struct {
 			Group string `json:"group"`
 		}
@@ -1607,6 +1873,7 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case http.MethodPut:
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 		var body struct {
 			Quota int64 `json:"quota"`
 		}
@@ -1635,6 +1902,7 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 
 	case http.MethodPatch:
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 		var body struct {
 			Delta int64 `json:"delta"`
 		}
@@ -1802,30 +2070,84 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 // Admin: /admin/ — dashboard HTML page
 // ---------------------------------------------------------------------------
 
-// handleAdmin validates the admin token and dispatches to sub-handlers.
-// All admin paths are: /admin/{token}/...
+func (s *Server) setAdminSession(w http.ResponseWriter, r *http.Request) {
+	writeSessionCookie(w, r, adminSessionCookieName, s.adminSession, 12*60*60)
+}
+
+func (s *Server) clearAdminSession(w http.ResponseWriter, r *http.Request) {
+	writeSessionCookie(w, r, adminSessionCookieName, "", -1)
+}
+
+func (s *Server) isAdminAuthenticated(r *http.Request) bool {
+	c, err := r.Cookie(adminSessionCookieName)
+	if err != nil || c.Value == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(s.adminSession)) == 1
+}
+
+func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(body.Token)), []byte(s.adminToken)) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	s.setAdminSession(w, r)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.clearAdminSession(w, r)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/admin/")
-	parts := strings.SplitN(path, "/", 2) // token [, rest]
-	if len(parts) == 0 || parts[0] == "" {
-		http.NotFound(w, r)
+	switch r.URL.Path {
+	case "/admin/login":
+		s.handleAdminLogin(w, r)
 		return
-	}
-	token := parts[0]
-	if token != s.adminToken {
-		http.NotFound(w, r)
+	case "/admin/logout":
+		s.handleAdminLogout(w, r)
 		return
-	}
-
-	rest := ""
-	if len(parts) == 2 {
-		rest = parts[1]
-	}
-
-	switch {
-	case rest == "" || rest == "/":
-		// /admin/{token}/ — dashboard page
+	case "/admin", "/admin/":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.isAdminAuthenticated(r) {
+			s.handleAdminLoginPage(w, r)
+			return
+		}
 		s.handleAdminPage(w, r)
+		return
+	}
+
+	if !strings.HasPrefix(r.URL.Path, "/admin/api/") {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.isAdminAuthenticated(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	rest := strings.TrimPrefix(r.URL.Path, "/admin/api/")
+	switch {
 	case rest == "overview":
 		s.handleAdminOverview(w, r)
 	case rest == "server-overview":
@@ -1837,7 +2159,10 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(rest, "users/"):
 		r.URL.Path = "/admin/users/" + strings.TrimPrefix(rest, "users/")
 		s.handleAdminUser(w, r)
-	case strings.HasPrefix(rest, "servers/") || rest == "servers":
+	case rest == "servers":
+		r.URL.Path = "/admin/servers/"
+		s.handleAdminServers(w, r)
+	case strings.HasPrefix(rest, "servers/"):
 		r.URL.Path = "/admin/servers/" + strings.TrimPrefix(rest, "servers/")
 		s.handleAdminServers(w, r)
 	case strings.HasPrefix(rest, "quota/"):
@@ -1851,11 +2176,65 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleAdminLoginPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, adminLoginPageHTML)
+}
+
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	html := strings.ReplaceAll(adminPageHTML, "{{ADMIN_TOKEN}}", s.adminToken)
-	fmt.Fprint(w, html)
+	fmt.Fprint(w, adminPageHTML)
 }
+
+const adminLoginPageHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hysteria Admin Login</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #333; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .card { background: #fff; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); padding: 40px 36px; max-width: 420px; width: 100%; text-align: center; }
+  h1 { font-size: 22px; color: #1a237e; margin-bottom: 6px; }
+  .sub { color: #888; font-size: 13px; margin-bottom: 28px; }
+  input[type="password"] { width: 100%; padding: 14px 16px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 15px; font-family: monospace; text-align: center; outline: none; transition: border-color 0.2s; margin-bottom: 12px; }
+  input[type="password"]:focus { border-color: #3949ab; }
+  .err { color: #f44336; font-size: 13px; min-height: 18px; margin-bottom: 12px; }
+  button { width: 100%; padding: 13px; background: #3949ab; color: #fff; border: none; border-radius: 8px; font-size: 15px; font-weight: 500; cursor: pointer; transition: background 0.2s; }
+  button:hover { background: #303f9f; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Hysteria Admin</h1>
+  <p class="sub">Enter your admin token</p>
+  <div id="err" class="err"></div>
+  <form onsubmit="login(event)">
+    <input type="password" id="token" placeholder="Admin token" autocomplete="off" autofocus>
+    <button type="submit">Sign In</button>
+  </form>
+</div>
+<script>
+function login(e) {
+  e.preventDefault();
+  var token = document.getElementById("token").value.trim();
+  if (!token) return;
+  fetch("/admin/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: token })
+  }).then(function(resp) {
+    if (!resp.ok) throw new Error("invalid");
+    window.location.href = "/admin";
+  }).catch(function() {
+    document.getElementById("err").textContent = "Invalid token.";
+  });
+}
+</script>
+</body>
+</html>
+`
 
 const adminPageHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -2106,10 +2485,19 @@ const adminPageHTML = `<!DOCTYPE html>
 
 <script>
 var GiB = 1073741824;
-var adminToken = "{{ADMIN_TOKEN}}";
-var A = "/admin/" + adminToken;
+var A = "/admin/api";
 var modalState = {};
 var currentTab = "users";
+var userDataCache = [];
+
+function escHtml(v) {
+  return String(v === undefined || v === null ? "" : v)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 function switchTab(tab) {
   currentTab = tab;
@@ -2181,6 +2569,37 @@ function removeGroup(uid, gname) {
   fetch(A + "/users/" + encodeURIComponent(uid) + "/groups/" + encodeURIComponent(gname), { method: "DELETE" })
     .then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); load(); })
     .catch(function(e) { alert("Failed: " + e.message); });
+}
+
+function deleteUserByIdx(i) {
+  var u = userDataCache[i];
+  if (!u) return;
+  deleteUser(u.id);
+}
+function removeServerByIdx(i, j) {
+  var u = userDataCache[i];
+  if (!u || !u.servers || u.servers[j] === undefined) return;
+  removeServer(u.id, u.servers[j]);
+}
+function removeGroupByIdx(i, j) {
+  var u = userDataCache[i];
+  if (!u || !u.groups || u.groups[j] === undefined) return;
+  removeGroup(u.id, u.groups[j]);
+}
+function openAddServerModalByIdx(i) {
+  var u = userDataCache[i];
+  if (!u) return;
+  openAddServerModal(u.id);
+}
+function openSetModalByIdx(i) {
+  var u = userDataCache[i];
+  if (!u) return;
+  openSetModal(u.id, u.quota);
+}
+function openAddModalByIdx(i) {
+  var u = userDataCache[i];
+  if (!u) return;
+  openAddModal(u.id, u.quota);
 }
 function updateAssignHint() {
   var isGroup = document.querySelector('input[name="assign-type"]:checked').value === "group";
@@ -2335,6 +2754,7 @@ document.getElementById("modal-confirm").addEventListener("click", function() {
 });
 
 function render(users) {
+  userDataCache = users || [];
   var tb = document.getElementById("tbody");
   if (!users || users.length === 0) {
     tb.innerHTML = '<tr><td colspan="10" class="empty">No users found</td></tr>';
@@ -2348,17 +2768,17 @@ function render(users) {
     var pctText = u.quota > 0 ? pct.toFixed(1) + "%" : "blocked";
     var servers = "";
     for (var j = 0; j < u.servers.length; j++) {
-      servers += '<span class="server-tag">' + u.servers[j] + '<span class="remove" onclick="removeServer(\'' + u.id + '\',\'' + u.servers[j] + '\')">&times;</span></span>';
+      servers += '<span class="server-tag">' + escHtml(u.servers[j]) + '<span class="remove" onclick="removeServerByIdx(' + i + ',' + j + ')">&times;</span></span>';
     }
     if (u.groups) {
       for (var g = 0; g < u.groups.length; g++) {
-        servers += '<span class="group-tag">' + u.groups[g] + '<span class="remove" onclick="removeGroup(\'' + u.id + '\',\'' + u.groups[g] + '\')">&times;</span></span>';
+        servers += '<span class="group-tag">' + escHtml(u.groups[g]) + '<span class="remove" onclick="removeGroupByIdx(' + i + ',' + g + ')">&times;</span></span>';
       }
     }
-    servers += '<span class="btn-add-srv" onclick="openAddServerModal(\'' + u.id + '\')">+</span>';
+    servers += '<span class="btn-add-srv" onclick="openAddServerModalByIdx(' + i + ')">+</span>';
     html += "<tr>"
-      + '<td><a href="/user/' + encodeURIComponent(u.token) + '" target="_blank" style="color:#333;text-decoration:none"><strong>' + u.id + '</strong></a></td>'
-      + '<td><a href="/user/' + encodeURIComponent(u.token) + '" target="_blank" style="font-family:monospace;font-size:12px;color:#666;text-decoration:none">' + u.token + '</a></td>'
+      + '<td><strong>' + escHtml(u.id) + '</strong></td>'
+      + '<td style="font-family:monospace;font-size:12px;color:#666">' + escHtml(u.token) + '</td>'
       + '<td class="num">' + fmt(u.tx) + "</td>"
       + '<td class="num">' + fmt(u.rx) + "</td>"
       + '<td class="num">' + fmt(total) + "</td>"
@@ -2367,9 +2787,9 @@ function render(users) {
       + "<td>" + (u.last_seen ? new Date(u.last_seen).toLocaleTimeString() + ' <span style="color:#888;font-size:11px">(' + fmtAgo(u.last_seen) + ')</span>' : "-") + "</td>"
       + '<td class="servers">' + servers + "</td>"
       + '<td class="quota-actions">'
-      + '<button class="btn-set" onclick="openSetModal(\'' + u.id + '\',' + u.quota + ')">Set</button>'
-      + '<button class="btn-add" onclick="openAddModal(\'' + u.id + '\',' + u.quota + ')">+ Add</button>'
-      + '<button class="btn-del" onclick="deleteUser(\'' + u.id + '\')">Del</button>'
+      + '<button class="btn-set" onclick="openSetModalByIdx(' + i + ')">Set</button>'
+      + '<button class="btn-add" onclick="openAddModalByIdx(' + i + ')">+ Add</button>'
+      + '<button class="btn-del" onclick="deleteUserByIdx(' + i + ')">Del</button>'
       + "</td>"
       + "</tr>";
   }
@@ -2400,6 +2820,7 @@ function generateServerId() {
 var srvEditId = "";
 var srvModalGroups = [];
 var srvModalOrigGroups = [];
+var srvModalSuggestGroups = [];
 
 function collectExistingGroups() {
   var gs = {};
@@ -2417,19 +2838,30 @@ function renderSrvModalGroups() {
   var chips = document.getElementById("srv-m-groups-chips");
   var html = '<span class="group-tag-default">all</span>';
   for (var i = 0; i < srvModalGroups.length; i++) {
-    var g = srvModalGroups[i];
-    html += '<span class="tag-chip">' + g + '<span class="remove" onclick="removeSrvModalGroup(\'' + g + '\')">&times;</span></span>';
+    html += '<span class="tag-chip">' + escHtml(srvModalGroups[i]) + '<span class="remove" onclick="removeSrvModalGroupByIdx(' + i + ')">&times;</span></span>';
   }
   chips.innerHTML = html;
   var suggest = document.getElementById("srv-m-groups-suggest");
   var existing = collectExistingGroups();
   var shtml = "";
+  srvModalSuggestGroups = [];
   for (var i = 0; i < existing.length; i++) {
     if (srvModalGroups.indexOf(existing[i]) === -1) {
-      shtml += '<button type="button" onclick="addSrvModalGroup(\'' + existing[i] + '\')">' + existing[i] + '</button>';
+      srvModalSuggestGroups.push(existing[i]);
+      shtml += '<button type="button" onclick="addSrvModalSuggested(' + (srvModalSuggestGroups.length - 1) + ')">' + escHtml(existing[i]) + '</button>';
     }
   }
   suggest.innerHTML = shtml;
+}
+
+function removeSrvModalGroupByIdx(i) {
+  if (i < 0 || i >= srvModalGroups.length) return;
+  removeSrvModalGroup(srvModalGroups[i]);
+}
+
+function addSrvModalSuggested(i) {
+  if (i < 0 || i >= srvModalSuggestGroups.length) return;
+  addSrvModalGroup(srvModalSuggestGroups[i]);
 }
 
 function addSrvModalGroup(name) {
@@ -2604,6 +3036,30 @@ function removeServerGroup(serverId, gname) {
     .catch(function(e) { alert("Failed: " + e.message); });
 }
 
+function removeServerGroupByIdx(i, j) {
+  var s = srvDataCache[i];
+  if (!s || !s.groups || s.groups[j] === undefined) return;
+  removeServerGroup(s.id, s.groups[j]);
+}
+
+function openAddGroupModalByIdx(i) {
+  var s = srvDataCache[i];
+  if (!s) return;
+  openAddGroupModal(s.id);
+}
+
+function restartBackendByIdx(i, btn) {
+  var s = srvDataCache[i];
+  if (!s) return;
+  restartBackend(s.id, btn);
+}
+
+function deleteServerByIdx(i) {
+  var s = srvDataCache[i];
+  if (!s) return;
+  deleteServer(s.id);
+}
+
 function fmtAgo(dateStr) {
   if (!dateStr) return "-";
   var ago = (Date.now() - new Date(dateStr).getTime()) / 1000;
@@ -2639,7 +3095,7 @@ function provisionBadge(status) {
   if (status === "running") color = "#2e7d32";
   else if (status === "creating" || status === "dns" || status === "deploying") color = "#e65100";
   else if (status.indexOf("error") === 0) color = "#c5221f";
-  return '<span style="color:' + color + ';font-weight:500;font-size:12px">' + status + '</span>';
+  return '<span style="color:' + color + ';font-weight:500;font-size:12px">' + escHtml(status) + '</span>';
 }
 function renderServers(servers) {
   srvDataCache = servers;
@@ -2654,18 +3110,18 @@ function renderServers(servers) {
     var groups = '<span class="group-tag-default">all</span>';
     if (s.groups) {
       for (var g = 0; g < s.groups.length; g++) {
-        groups += '<span class="group-tag">' + s.groups[g] + '<span class="remove" onclick="removeServerGroup(\'' + s.id + '\',\'' + s.groups[g] + '\')">&times;</span></span>';
+        groups += '<span class="group-tag">' + escHtml(s.groups[g]) + '<span class="remove" onclick="removeServerGroupByIdx(' + i + ',' + g + ')">&times;</span></span>';
       }
     }
-    groups += '<span class="btn-add-srv" onclick="openAddGroupModal(\'' + s.id + '\')">+</span>';
+    groups += '<span class="btn-add-srv" onclick="openAddGroupModalByIdx(' + i + ')">+</span>';
     html += "<tr>"
-      + "<td><strong>" + s.id + "</strong></td>"
-      + '<td style="font-family:monospace;font-size:12px;color:#666">' + s.token + "</td>"
-      + "<td>" + (s.acme_domain || '<span style="color:#ccc">-</span>') + "</td>"
-      + "<td>" + (s.ip || '<span style="color:#ccc">-</span>') + "</td>"
+      + "<td><strong>" + escHtml(s.id) + "</strong></td>"
+      + '<td style="font-family:monospace;font-size:12px;color:#666">' + escHtml(s.token) + "</td>"
+      + "<td>" + (s.acme_domain ? escHtml(s.acme_domain) : '<span style="color:#ccc">-</span>') + "</td>"
+      + "<td>" + (s.ip ? escHtml(s.ip) : '<span style="color:#ccc">-</span>') + "</td>"
       + "<td>" + provisionBadge(s.provision_status) + "</td>"
       + "<td>" + statusBadge(s.last_seen) + "</td>"
-      + "<td>" + (s.hysteria_version || '<span style="color:#ccc">-</span>') + "</td>"
+      + "<td>" + (s.hysteria_version ? escHtml(s.hysteria_version) : '<span style="color:#ccc">-</span>') + "</td>"
       + "<td>" + fmtUptime(s.uptime_seconds) + "</td>"
       + "<td>" + (s.last_seen ? new Date(s.last_seen).toLocaleTimeString() + ' <span style="color:#888;font-size:11px">(' + fmtAgo(s.last_seen) + ')</span>' : "-") + "</td>"
       + '<td class="num">' + fmt(s.tx) + "</td>"
@@ -2675,8 +3131,8 @@ function renderServers(servers) {
       + '<td class="servers">' + groups + "</td>"
       + '<td class="quota-actions">'
       + '<button class="btn-edit" onclick="openEditSrvModal(srvDataCache[' + i + '])">Edit</button>'
-      + '<button class="btn-edit" onclick="restartBackend(\'' + s.id + '\', this)">Restart</button>'
-      + '<button class="btn-del" onclick="deleteServer(\'' + s.id + '\')">Del</button>'
+      + '<button class="btn-edit" onclick="restartBackendByIdx(' + i + ', this)">Restart</button>'
+      + '<button class="btn-del" onclick="deleteServerByIdx(' + i + ')">Del</button>'
       + "</td>"
       + "</tr>";
   }
@@ -2735,23 +3191,27 @@ func (s *Server) resolveServerToken(token string) string {
 }
 
 // ---------------------------------------------------------------------------
-// GET /backend/config/{server_token} — return server config for backend node
+// GET /backend/config — return server config for backend node
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleServerConfig(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/backend/config" {
+		http.NotFound(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	token := strings.TrimPrefix(r.URL.Path, "/backend/config/")
+	token := readBearerToken(r)
 	if token == "" {
-		http.Error(w, "missing server token", http.StatusBadRequest)
+		http.Error(w, "missing server token", http.StatusUnauthorized)
 		return
 	}
 	serverID := s.resolveServerToken(token)
 	if serverID == "" {
-		http.Error(w, "server not found", http.StatusNotFound)
+		http.Error(w, "invalid server token", http.StatusUnauthorized)
 		return
 	}
 
@@ -2786,7 +3246,7 @@ func (s *Server) handleServerConfig(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[INFO] GET /server/config/%s: ok", serverID)
 	if s.debug {
-		log.Printf("[DEBUG] GET /server/config/%s: %+v", serverID, cfg)
+		log.Printf("[DEBUG] GET /server/config/%s: domain=%q region=%q size=%q", serverID, cfg.AcmeDomain, cfg.Region, cfg.Size)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2794,33 +3254,38 @@ func (s *Server) handleServerConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /server/status/{server_id} — receive status from backend node
+// POST /backend/status — receive status from backend node
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleServerStatus(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/backend/status" {
+		http.NotFound(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	token := strings.TrimPrefix(r.URL.Path, "/backend/status/")
+	token := readBearerToken(r)
 	if token == "" {
-		http.Error(w, "missing server token", http.StatusBadRequest)
+		http.Error(w, "missing server token", http.StatusUnauthorized)
 		return
 	}
 	serverID := s.resolveServerToken(token)
 	if serverID == "" {
-		http.Error(w, "server not found", http.StatusNotFound)
+		http.Error(w, "invalid server token", http.StatusUnauthorized)
 		return
 	}
 
 	var body struct {
-		Status          string `json:"status"`
-		HysteriaVersion string `json:"hysteria_version"`
-		BackendVersion  string `json:"backend_version"`
+		Status           string `json:"status"`
+		HysteriaVersion  string `json:"hysteria_version"`
+		BackendVersion   string `json:"backend_version"`
 		LastConfigUpdate string `json:"last_config_update"`
-		UptimeSeconds   int64  `json:"uptime_seconds"`
+		UptimeSeconds    int64  `json:"uptime_seconds"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -3197,6 +3662,11 @@ func (s *Server) provisionServer(serverID string) {
 		s.updateProvisionStatus(serverID, "error: "+err.Error())
 		return
 	}
+	if !isValidIP(ip) {
+		log.Printf("[INFO] provision %s: invalid IP from DO: %q", serverID, ip)
+		s.updateProvisionStatus(serverID, "error: invalid IP")
+		return
+	}
 	log.Printf("[INFO] provision %s: droplet active, ip=%s", serverID, ip)
 	s.updateDropletInfo(serverID, dropletID, ip)
 
@@ -3213,7 +3683,7 @@ func (s *Server) provisionServer(serverID string) {
 	// 4. Deploy via SSH.
 	s.updateProvisionStatus(serverID, "deploying")
 	sshKey := strings.TrimSuffix(s.doSSHKeyFile, ".pub")
-	sshOpts := []string{"-i", sshKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=5"}
+	sshOpts := []string{"-i", sshKey, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"}
 	target := "root@" + ip
 
 	// Wait for SSH readiness.
@@ -3240,6 +3710,13 @@ func (s *Server) provisionServer(serverID string) {
 		return
 	}
 	log.Printf("[INFO] provision %s: backend binary deployed", serverID)
+
+	// Validate values before embedding in the systemd service file.
+	if !isSafeShellArg(s.baseURL) || !isSafeShellArg(serverToken) {
+		log.Printf("[INFO] provision %s: unsafe baseURL or serverToken, aborting", serverID)
+		s.updateProvisionStatus(serverID, "error: unsafe config values")
+		return
+	}
 
 	// Make binary executable + create systemd service + start it.
 	serviceFile := fmt.Sprintf(`[Unit]

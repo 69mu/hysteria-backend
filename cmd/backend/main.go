@@ -294,12 +294,18 @@ func getHysteriaVersion() string {
 // ---------------------------------------------------------------------------
 
 func fetchConfig(centralBase, serverID string, debug bool) (*ServerConfig, error) {
-	url := centralBase + "/backend/config/" + serverID
+	url := centralBase + "/backend/config"
 	if debug {
 		log.Printf("[DEBUG] config fetch: GET %s", url)
 	}
 
-	resp, err := http.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("new request %s: %w", url, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+serverID)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("GET %s: %w", url, err)
 	}
@@ -402,7 +408,7 @@ func (a *App) centralAuthURL() string {
 	if u == "" {
 		u = a.centralServer + "/backend/auth"
 	}
-	return strings.TrimRight(u, "/") + "/" + a.serverID
+	return strings.TrimRight(u, "/")
 }
 
 func (a *App) centralTrafficURL() string {
@@ -412,7 +418,7 @@ func (a *App) centralTrafficURL() string {
 	if u == "" {
 		u = a.centralServer + "/backend/traffic"
 	}
-	return strings.TrimRight(u, "/") + "/" + a.serverID
+	return strings.TrimRight(u, "/")
 }
 
 func (a *App) periodicAuthFetch() {
@@ -434,7 +440,14 @@ func (a *App) fetchAuthList() {
 	if a.debug {
 		log.Printf("[DEBUG] auth fetch: GET %s", url)
 	}
-	resp, err := http.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		log.Printf("[INFO] auth fetch: build request error: %v", err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+a.serverID)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("[INFO] auth fetch error: %v", err)
 		return
@@ -705,7 +718,16 @@ func (a *App) reportTraffic() {
 		log.Printf("[DEBUG] traffic report: POST %s", url)
 	}
 	body, _ := json.Marshal(snapshot)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[INFO] traffic report: build request error: %v", err)
+		a.mergeTraffic(snapshot)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+a.serverID)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("[INFO] traffic report: POST error: %v", err)
 		a.mergeTraffic(snapshot)
@@ -756,7 +778,7 @@ func (a *App) reportStatus(hysteriaVersion string) {
 	lastCfg := a.lastConfigUpdate
 	a.configMu.RUnlock()
 
-	url := a.centralServer + "/backend/status/" + a.serverID
+	url := a.centralServer + "/backend/status"
 	body, _ := json.Marshal(map[string]interface{}{
 		"status":             "active",
 		"hysteria_version":   hysteriaVersion,
@@ -765,7 +787,15 @@ func (a *App) reportStatus(hysteriaVersion string) {
 		"uptime_seconds":     int64(time.Since(a.startTime).Seconds()),
 	})
 
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[INFO] status report: build request error: %v", err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+a.serverID)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("[INFO] status report: POST error: %v", err)
 		return
