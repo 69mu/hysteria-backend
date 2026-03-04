@@ -1,5 +1,3 @@
-backend
-central
 test-dns.db-shm
 test-dns.db-wal
 test-groups.db-shm
